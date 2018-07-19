@@ -2,6 +2,10 @@ package migrations
 
 import (
 	"database/sql"
+	"encoding/json"
+	"io/ioutil"
+	"os"
+	"path"
 
 	"github.com/OpenBazaar/jsonpb"
 	"github.com/OpenBazaar/openbazaar-go/pb"
@@ -9,6 +13,65 @@ import (
 )
 
 type Migration009 struct{}
+
+type Migration009_price struct {
+	CurrencyCode string `json:"currencyCode"`
+	Amount       uint64 `json:"amount"`
+}
+type Migration009_thumbnail struct {
+	Tiny   string `json:"tiny"`
+	Small  string `json:"small"`
+	Medium string `json:"medium"`
+}
+
+type Migration009_listingDataBeforeMigration struct {
+	Hash          string                 `json:"hash"`
+	Slug          string                 `json:"slug"`
+	Title         string                 `json:"title"`
+	Categories    []string               `json:"categories"`
+	NSFW          bool                   `json:"nsfw"`
+	CoinType      string                 `json:"coinType"`
+	ContractType  string                 `json:"contractType"`
+	Description   string                 `json:"description"`
+	Thumbnail     Migration009_thumbnail `json:"thumbnail"`
+	Price         Migration009_price     `json:"price"`
+	ShipsTo       []string               `json:"shipsTo"`
+	FreeShipping  []string               `json:"freeShipping"`
+	Language      string                 `json:"language"`
+	AverageRating float32                `json:"averageRating"`
+	RatingCount   uint32                 `json:"ratingCount"`
+	ModeratorIDs  []string               `json:"moderators"`
+}
+
+type Migration009_listingDataAfterMigration struct {
+	Hash          string                 `json:"hash"`
+	Slug          string                 `json:"slug"`
+	Title         string                 `json:"title"`
+	Categories    []string               `json:"categories"`
+	NSFW          bool                   `json:"nsfw"`
+	CoinType      string                 `json:"coinType"`
+	ContractType  string                 `json:"contractType"`
+	Description   string                 `json:"description"`
+	Thumbnail     Migration009_thumbnail `json:"thumbnail"`
+	Price         Migration009_price     `json:"price"`
+	ShipsTo       []string               `json:"shipsTo"`
+	FreeShipping  []string               `json:"freeShipping"`
+	Language      string                 `json:"language"`
+	AverageRating float32                `json:"averageRating"`
+	RatingCount   uint32                 `json:"ratingCount"`
+	ModeratorIDs  []string               `json:"moderators"`
+
+	// Adding AcceptedCurrencies
+	AcceptedCurrencies []string `json:"acceptedCurrencies"`
+}
+
+type Migration009_listing struct {
+	Listing struct {
+		Metadata struct {
+			AcceptedCurrencies []string `json:"acceptedCurrencies`
+		} `json:"metadata"`
+	} `json:"listing"`
+}
 
 var (
 	Migration009CreateCasesTable     = "create table cases (caseID text primary key not null, buyerContract blob, vendorContract blob, buyerValidationErrors blob, vendorValidationErrors blob, buyerPayoutAddress text, vendorPayoutAddress text, buyerOutpoints blob, vendorOutpoints blob, state integer, read integer, timestamp integer, buyerOpened integer, claim text, disputeResolution blob, lastDisputeExpiryNotifiedAt integer not null default 0);"
@@ -67,6 +130,11 @@ func (Migration009) Up(repoPath string, dbPassword string, testnet bool) (err er
 		return err
 	}
 
+	err = migration009MigrateListingsIndexUp(repoPath)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -109,6 +177,12 @@ func (Migration009) Down(repoPath string, dbPassword string, testnet bool) error
 	if err != nil {
 		return err
 	}
+
+	err = migration009MigrateListingsIndexDown(repoPath)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -187,4 +261,124 @@ func coinTypeForContract(contract *pb.RicardianContract) string {
 	}
 
 	return coinType
+}
+
+func migration009MigrateListingsIndexUp(repoPath string) error {
+	listingsFilePath := path.Join(repoPath, "root", "listings.json")
+
+	if _, err := os.Stat(listingsFilePath); os.IsNotExist(err) {
+		return nil
+	}
+
+	var (
+		err             error
+		paymentCoin     string
+		listingJSON     []byte
+		listingsJSON    []byte
+		listingRecord   Migration009_listing
+		listingRecords  []Migration009_listingDataBeforeMigration
+		migratedRecords []Migration009_listingDataAfterMigration
+	)
+
+	listingsJSON, err = ioutil.ReadFile(listingsFilePath)
+	if err != nil {
+		return err
+	}
+	if err = json.Unmarshal(listingsJSON, &listingRecords); err != nil {
+		return err
+	}
+
+	for _, listing := range listingRecords {
+		if paymentCoin == "" {
+			listingFilePath := path.Join(repoPath, "root", "listings", listing.Slug+".json")
+			listingJSON, err = ioutil.ReadFile(listingFilePath)
+			if err != nil {
+				return err
+			}
+			if err = json.Unmarshal(listingJSON, &listingRecord); err != nil {
+				return err
+			}
+			paymentCoin = listingRecord.Listing.Metadata.AcceptedCurrencies[0]
+		}
+
+		migratedRecords = append(migratedRecords, Migration009_listingDataAfterMigration{
+			Hash:               listing.Hash,
+			Slug:               listing.Slug,
+			Title:              listing.Title,
+			Categories:         listing.Categories,
+			NSFW:               listing.NSFW,
+			ContractType:       listing.ContractType,
+			Description:        listing.Description,
+			Thumbnail:          listing.Thumbnail,
+			Price:              listing.Price,
+			ShipsTo:            listing.ShipsTo,
+			FreeShipping:       listing.FreeShipping,
+			Language:           listing.Language,
+			AverageRating:      listing.AverageRating,
+			RatingCount:        listing.RatingCount,
+			CoinType:           listing.CoinType,
+			AcceptedCurrencies: []string{paymentCoin},
+		})
+	}
+	if listingsJSON, err = json.MarshalIndent(migratedRecords, "", "    "); err != nil {
+		return err
+	}
+	err = ioutil.WriteFile(listingsFilePath, listingsJSON, os.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func migration009MigrateListingsIndexDown(repoPath string) error {
+	listingsFilePath := path.Join(repoPath, "root", "listings.json")
+
+	if _, err := os.Stat(listingsFilePath); os.IsNotExist(err) {
+		return nil
+	}
+
+	var (
+		err             error
+		listingsJSON    []byte
+		listingRecords  []Migration009_listingDataBeforeMigration
+		migratedRecords []Migration009_listingDataAfterMigration
+	)
+
+	listingsJSON, err = ioutil.ReadFile(listingsFilePath)
+	if err != nil {
+		return err
+	}
+	if err = json.Unmarshal(listingsJSON, &listingRecords); err != nil {
+		return err
+	}
+
+	for _, listing := range listingRecords {
+		migratedRecords = append(migratedRecords, Migration009_listingDataAfterMigration{
+			Hash:          listing.Hash,
+			Slug:          listing.Slug,
+			Title:         listing.Title,
+			Categories:    listing.Categories,
+			NSFW:          listing.NSFW,
+			ContractType:  listing.ContractType,
+			Description:   listing.Description,
+			Thumbnail:     listing.Thumbnail,
+			Price:         listing.Price,
+			ShipsTo:       listing.ShipsTo,
+			FreeShipping:  listing.FreeShipping,
+			Language:      listing.Language,
+			AverageRating: listing.AverageRating,
+			RatingCount:   listing.RatingCount,
+			CoinType:      listing.CoinType,
+		})
+	}
+	if listingsJSON, err = json.MarshalIndent(migratedRecords, "", "    "); err != nil {
+		return err
+	}
+	err = ioutil.WriteFile(listingsFilePath, listingsJSON, os.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
